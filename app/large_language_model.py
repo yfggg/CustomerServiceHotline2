@@ -1,17 +1,15 @@
 import asyncio
-import asyncio
-import os
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
-
+from typing import Any, List
+from agents.alert_agent import AlertDecisionAgent
 from langchain_community.chat_models import ChatTongyi
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableMap, RunnablePassthrough, RunnableLambda
+from langchain_core.runnables import RunnableLambda, RunnableMap, RunnablePassthrough
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
+from mcp_service.alert_router import AlertRouter
 from app.vector_db import CustomStagedRetriever
 
 
@@ -34,19 +32,29 @@ class ChatAssistant:
     def __init__(self):
         self.messages: List[Any] = []
         self.tools = asyncio.run(self._load_mcp_tools())
+        self.alert_agent = AlertDecisionAgent()
+        self.alert_router = AlertRouter(self.tools)
         self.chain = self._build_chain()
 
     @staticmethod
     async def _load_mcp_tools():
-        """启动本地 MCP db 服务（stdio），并获取工具列表。"""
-        server_path = Path(__file__).resolve().parent.parent / "mcp_service" / "db_server.py"
+        """启动本地 MCP db/feishu 服务（stdio），并获取工具列表。"""
+        service_dir = Path(__file__).resolve().parent.parent / "mcp_service"
+        db_server = service_dir / "db_server.py"
+        feishu_server = service_dir / "feishu_server.py"
         client = MultiServerMCPClient(
             {
                 "db": {
                     "transport": "stdio",
                     "command": sys.executable,
-                    "args": [str(server_path)],
-                    "cwd": str(server_path.parent),
+                    "args": [str(db_server)],
+                    "cwd": str(db_server.parent),
+                },
+                "feishu": {
+                    "transport": "stdio",
+                    "command": sys.executable,
+                    "args": [str(feishu_server)],
+                    "cwd": str(feishu_server.parent),
                 }
             }
         )
@@ -128,6 +136,15 @@ class ChatAssistant:
         self.messages.extend(tool_messages)
         return combined_results
 
+    def _maybe_alert(self, question: str, ai_reply: str) -> None:
+        try:
+            decision = self.alert_agent.decide(question, ai_reply)
+            if not decision.escalate:
+                return
+            self.alert_router.send(decision.channels, decision.reason, question, ai_reply)
+        except Exception:
+            pass
+
     def stream_chat(self, question: str) -> str:
         cleaned_question = question.strip()
         if not cleaned_question:
@@ -142,12 +159,14 @@ class ChatAssistant:
                 # 执行工具并写入历史
                 self._handle_tool_calls(result_msg)
                 # 再次调用模型，基于完整历史（含工具结果）生成综合回复
-                final_msg: AIMessage = self.chain.invoke(cleaned_question)
-                self.messages.append(final_msg)
-                return final_msg.content
+                reply_msg: AIMessage = self.chain.invoke(cleaned_question)
+                self.messages.append(reply_msg)
+            else:
+                reply_msg = result_msg
+                self.messages.append(reply_msg)
 
-            self.messages.append(result_msg)
-            return result_msg.content
+            self._maybe_alert(cleaned_question, reply_msg.content)
+            return reply_msg.content
         except Exception as e:
             return str(e)
 
